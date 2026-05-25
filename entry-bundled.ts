@@ -26,6 +26,9 @@ export default defineBundledChannelEntry({
   },
   async registerFull(api) {
     const { registerGatewayMethods } = await import("./src/gateway-methods.ts");
+    const { installDingtalkCardBridge, registerDingtalkCardGatewayMethods } = await import("./src/services/card-bridge.ts");
     registerGatewayMethods(api);
+    installDingtalkCardBridge(api);
+    registerDingtalkCardGatewayMethods(api);
   },
 });
