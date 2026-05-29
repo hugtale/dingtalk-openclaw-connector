@@ -49,6 +49,29 @@ export type CardUpdateParams = {
   log?: LoggerLike;
 };
 
+export type CurrentReplyCardUpdateParams = {
+  sessionKey: string;
+  markdown?: string;
+  status?: CardUpdateStatus;
+  log?: LoggerLike;
+};
+
+export type CurrentReplyCardUpdateResult = {
+  sessionKey: string;
+  cardInstanceId: string;
+  status: CardUpdateStatus;
+  claimed: true;
+};
+
+export type CurrentReplyCardSlot = {
+  ensureCard: () => Promise<{
+    card: AICardInstance;
+    config: DingtalkConfig;
+  } | null>;
+  claim: () => void;
+  release: () => void;
+};
+
 export type DingtalkCardBridge = {
   create(params: CardCreateParams): Promise<{
     cardInstanceId: string;
@@ -59,9 +82,11 @@ export type DingtalkCardBridge = {
     cardInstanceId: string;
     status: CardUpdateStatus;
   }>;
+  updateCurrentReply?(params: CurrentReplyCardUpdateParams): Promise<CurrentReplyCardUpdateResult>;
 };
 
 const cards = new Map<string, CardRecord>();
+const currentReplyCards = new Map<string, CurrentReplyCardSlot>();
 let cleanupTimerInstalled = false;
 
 class PublicError extends Error {}
@@ -176,6 +201,35 @@ function rememberCard(card: AICardInstance, config: DingtalkConfig, log?: Logger
   return record;
 }
 
+function rememberCardIfMissing(card: AICardInstance, config: DingtalkConfig, log?: LoggerLike): CardRecord {
+  const existing = cards.get(card.cardInstanceId);
+  if (existing) {
+    existing.lastUsedAt = nowMs();
+    return existing;
+  }
+  return rememberCard(card, config, log);
+}
+
+function normalizeSessionKey(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+export function registerCurrentReplyCard(sessionKey: string, slot: CurrentReplyCardSlot): () => void {
+  const key = normalizeSessionKey(sessionKey);
+  if (!key) return () => undefined;
+  currentReplyCards.set(key, slot);
+  return () => unregisterCurrentReplyCard(key, slot);
+}
+
+export function unregisterCurrentReplyCard(sessionKey: string, slot?: CurrentReplyCardSlot): void {
+  const key = normalizeSessionKey(sessionKey);
+  if (!key) return;
+  const current = currentReplyCards.get(key);
+  if (!slot || current === slot) {
+    currentReplyCards.delete(key);
+  }
+}
+
 async function loadRuntimeConfig(
   api: OpenClawPluginApi,
   cfg?: ClawdbotConfig,
@@ -288,6 +342,45 @@ async function updateCardRecord(
   }
 }
 
+async function updateCurrentReplyCard(params: {
+  sessionKey: string;
+  markdown: string;
+  status?: CardUpdateStatus;
+  log?: LoggerLike;
+}): Promise<CurrentReplyCardUpdateResult> {
+  const sessionKey = normalizeSessionKey(params.sessionKey);
+  if (!sessionKey) throw new PublicError("sessionKey is required");
+  const slot = currentReplyCards.get(sessionKey);
+  if (!slot) throw new PublicError("Current reply card not found for sessionKey");
+
+  const currentReply = await slot.ensureCard();
+  if (!currentReply?.card) throw new PublicError("Current reply card is unavailable");
+
+  rememberCardIfMissing(currentReply.card, currentReply.config, params.log);
+
+  const status = normalizeStatus(params.status);
+  try {
+    const result = await updateCard({
+      cardInstanceId: currentReply.card.cardInstanceId,
+      markdown: params.markdown,
+      status,
+      log: params.log,
+    });
+    slot.claim();
+    return {
+      sessionKey,
+      cardInstanceId: result.cardInstanceId,
+      status: result.status,
+      claimed: true,
+    };
+  } finally {
+    if (status === "completed" || status === "failed") {
+      slot.release();
+      unregisterCurrentReplyCard(sessionKey, slot);
+    }
+  }
+}
+
 /**
  * Return the in-process DingTalk card bridge installed by this connector.
  *
@@ -295,6 +388,7 @@ async function updateCardRecord(
  * - Symbol key: `Symbol.for("@dingtalk-connector/card-bridge")`
  * - `create({ target, accountId?, markdown?, cfg?, log? })`
  * - `update({ cardInstanceId, markdown?, status?, log? })`
+ * - `updateCurrentReply({ sessionKey, markdown?, status?, log? })`
  *
  * This bridge is intentionally process-local. Cross-process callers should use
  * the gateway methods registered below instead.
@@ -323,6 +417,14 @@ export function installDingtalkCardBridge(api: OpenClawPluginApi): void {
       if (!params?.cardInstanceId) throw new PublicError("cardInstanceId is required");
       return updateCard({
         cardInstanceId: String(params.cardInstanceId),
+        markdown: String(params?.markdown ?? ""),
+        status: normalizeStatus(params?.status),
+        log: params?.log ?? api.logger,
+      });
+    },
+    async updateCurrentReply(params: CurrentReplyCardUpdateParams) {
+      return updateCurrentReplyCard({
+        sessionKey: String(params?.sessionKey ?? ""),
         markdown: String(params?.markdown ?? ""),
         status: normalizeStatus(params?.status),
         log: params?.log ?? api.logger,

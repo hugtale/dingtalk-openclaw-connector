@@ -66,9 +66,12 @@ vi.mock("../../src/utils/token.ts", () => ({
   getOapiAccessToken: mockGetOapiAccessToken,
 }));
 
+const CARD_BRIDGE_SYMBOL = Symbol.for("@dingtalk-connector/card-bridge");
+
 describe("reply-dispatcher", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    delete (globalThis as any)[CARD_BRIDGE_SYMBOL];
     mockResolveDingtalkAccount.mockReturnValue({
       accountId: "acc-1",
       config: { debug: false, streaming: true },
@@ -334,5 +337,69 @@ describe("reply-dispatcher", () => {
     await args.onIdle();
 
     expect(mockSendMarkdownMessage).not.toHaveBeenCalled();
+  });
+
+  it("lets an in-process tool claim and update the current reply card", async () => {
+    const { createDingtalkReplyDispatcher } = await import("../../src/reply-dispatcher");
+    const { installDingtalkCardBridge } = await import("../../src/services/card-bridge");
+    const runtime = {
+      log: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    };
+
+    installDingtalkCardBridge({ logger: runtime } as any);
+    const bridge = (globalThis as any)[CARD_BRIDGE_SYMBOL];
+    const result = createDingtalkReplyDispatcher({
+      cfg: {} as any,
+      agentId: "a1",
+      runtime: runtime as any,
+      conversationId: "conv-1",
+      senderId: "user-1",
+      isDirect: true,
+      sessionWebhook: "http://webhook",
+      sessionKey: "session-1",
+    });
+
+    const args = (globalThis as any).__dispatcherArgs;
+    await args.onReplyStart();
+    mockStreamAICard.mockClear();
+    mockFinishAICard.mockClear();
+
+    await bridge.updateCurrentReply({
+      sessionKey: "session-1",
+      markdown: "过程内容",
+      status: "running",
+    });
+
+    expect(mockStreamAICard).toHaveBeenCalledTimes(1);
+    expect(mockStreamAICard).toHaveBeenLastCalledWith(
+      expect.objectContaining({ cardInstanceId: "c1" }),
+      "过程内容",
+      false,
+      expect.any(Object),
+      runtime,
+    );
+
+    await result.replyOptions.onPartialReply?.({ text: "connector partial should be skipped" });
+    await args.deliver({ text: "connector final should be skipped" }, { kind: "final" });
+    expect(mockStreamAICard).toHaveBeenCalledTimes(1);
+    expect(mockFinishAICard).not.toHaveBeenCalled();
+
+    await bridge.updateCurrentReply({
+      sessionKey: "session-1",
+      markdown: "最终内容",
+      status: "completed",
+    });
+
+    expect(mockFinishAICard).toHaveBeenCalledTimes(1);
+    expect(mockFinishAICard).toHaveBeenLastCalledWith(
+      expect.objectContaining({ cardInstanceId: "c1" }),
+      "最终内容",
+      expect.any(Object),
+      runtime,
+    );
   });
 });

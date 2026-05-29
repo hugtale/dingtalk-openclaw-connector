@@ -11,6 +11,7 @@ import {
   DINGTALK_CARD_BRIDGE_SYMBOL,
   getDingtalkCardBridge,
   installDingtalkCardBridge,
+  registerCurrentReplyCard,
   registerDingtalkCardGatewayMethods,
 } from '../src/services/card-bridge';
 
@@ -631,6 +632,76 @@ describe('Card Gateway Methods - 参数验证', () => {
     expect(bridge).toBe((globalThis as any)[DINGTALK_CARD_BRIDGE_SYMBOL]);
     expect(typeof bridge?.create).toBe('function');
     expect(typeof bridge?.update).toBe('function');
+    expect(typeof bridge?.updateCurrentReply).toBe('function');
+  });
+
+  it('同进程 bridge 应支持更新当前回复卡片', async () => {
+    installDingtalkCardBridge(mockApi.api);
+    const bridge = getDingtalkCardBridge();
+    let claimed = false;
+    let released = false;
+    const unregister = registerCurrentReplyCard('session-1', {
+      ensureCard: async () => ({
+        card: {
+          cardInstanceId: 'current_card_1',
+          accessToken: 'token',
+          tokenExpireTime: Date.now() + 60_000,
+          inputingStarted: false,
+        },
+        config: mockConfig.channels['dingtalk-connector'] as any,
+      }),
+      claim: () => {
+        claimed = true;
+      },
+      release: () => {
+        released = true;
+      },
+    });
+
+    try {
+      const running = await bridge?.updateCurrentReply({
+        sessionKey: 'session-1',
+        markdown: '处理中',
+        status: 'running',
+      });
+
+      expect(running).toEqual({
+        sessionKey: 'session-1',
+        cardInstanceId: 'current_card_1',
+        status: 'running',
+        claimed: true,
+      });
+      expect(claimed).toBe(true);
+      expect(mockStreamAICard).toHaveBeenCalledWith(
+        expect.objectContaining({ cardInstanceId: 'current_card_1' }),
+        '处理中',
+        false,
+        expect.any(Object),
+        mockLogger,
+      );
+
+      const completed = await bridge?.updateCurrentReply({
+        sessionKey: 'session-1',
+        markdown: '完成',
+        status: 'completed',
+      });
+
+      expect(completed?.status).toBe('completed');
+      expect(released).toBe(true);
+      expect(mockFinishAICard).toHaveBeenCalledWith(
+        expect.objectContaining({ cardInstanceId: 'current_card_1' }),
+        '完成',
+        expect.any(Object),
+        mockLogger,
+      );
+
+      await expect(bridge?.updateCurrentReply({
+        sessionKey: 'session-1',
+        markdown: '不应成功',
+      })).rejects.toThrow(/Current reply card not found/);
+    } finally {
+      unregister();
+    }
   });
 });
 
